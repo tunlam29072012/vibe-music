@@ -1,1 +1,65 @@
+name: Build Vibe Music APK
 
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+      - name: Initialize Android project & Patch Manifest
+        run: |
+          flutter create . --project-name vibe_music --platforms=android
+          python3 -c '
+          import re
+          path = "android/app/src/main/AndroidManifest.xml"
+          with open(path, "r") as f:
+              xml = f.read()
+          perms = """    <uses-permission android:name="android.permission.INTERNET"/>
+              <uses-permission android:name="android.permission.WAKE_LOCK"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK"/>
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <uses-permission android:name="android.permission.READ_MEDIA_AUDIO"/>
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32"/>
+          """
+          xml = re.sub(r"(<manifest[^>]*>)", r"\1\n" + perms, xml, count=1)
+          xml = xml.replace("android:name=\".MainActivity\"", "android:name=\"com.ryanheise.audioservice.AudioServiceActivity\"")
+          xml = xml.replace("android:label=\"vibe_music\"", "android:label=\"Vibe Music\"")
+          srv = """
+                  <service
+                      android:name="com.ryanheise.audioservice.AudioService"
+                      android:foregroundServiceType="mediaPlayback"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.media.browse.MediaBrowserService" />
+                      </intent-filter>
+                  </service>
+                  <receiver
+                      android:name="com.ryanheise.audioservice.MediaButtonReceiver"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.media.action.MEDIA_BUTTON" />
+                      </intent-filter>
+                  </receiver>
+              </application>"""
+          xml = xml.replace("</application>", srv)
+          with open(path, "w") as f:
+              f.write(xml)
+          '
+      - run: flutter pub get
+      - run: flutter build apk --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Vibe-Music-APK
+          path: build/app/outputs/flutter-apk/app-release.apk
