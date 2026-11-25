@@ -1,8 +1,11 @@
+import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:just_audio_background/just_audio_background.dart';
+import 'package:audio_session/audio_session.dart';
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:path_provider/path_provider.dart';
@@ -14,9 +17,12 @@ Future<void> main() async {
     androidNotificationChannelId: 'com.vibemusic.channel.audio',
     androidNotificationChannelName: 'Vibe Music Playback',
     androidNotificationOngoing: true,
+    androidStopForegroundOnPause: false,
   );
   runApp(const VibeMusicApp());
 }
+
+enum RepeatMode { off, all, one }
 
 class SongItem {
   final String id;
@@ -59,14 +65,26 @@ class PlayerScreen extends StatefulWidget {
   State<PlayerScreen> createState() => _PlayerScreenState();
 }
 
-class _PlayerScreenState extends State<PlayerScreen> {
+class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver {
   final AudioPlayer _player = AudioPlayer();
+  final TextEditingController _searchCtrl = TextEditingController();
   final List<SongItem> _library = [];
   List<SongItem> _queue = [];
   int _currentIndex = 0;
   bool _isShuffle = false;
+  RepeatMode _repeatMode = RepeatMode.all;
   bool _isDownloading = false;
+  String _searchQuery = '';
+
   late Directory _musicDir;
+  late File _stateFile;
+  Timer? _saveDebounce;
+
+  // Sleep Timer state
+  Timer? _sleepTimer;
+  Timer? _countdownTicker;
+  DateTime? _sleepEndTime;
+  Duration _remainingSleep = Duration.zero;
 
   static const _musicExts = ['.mp3', '.m4a', '.wav', '.ogg'];
   static const _imgExts = ['.jpg', '.jpeg', '.png', '.webp'];
@@ -74,16 +92,38 @@ class _PlayerScreenState extends State<PlayerScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _initApp();
 
     _player.processingStateStream.listen((state) {
       if (state == ProcessingState.completed && _queue.isNotEmpty) {
-        _nextSong();
+        if (_repeatMode == RepeatMode.one) {
+          _player.seek(Duration.zero);
+          _player.play();
+        } else {
+          _nextSong(autoAdvance: true);
+        }
+      }
+    });
+
+    _player.positionStream.listen((pos) {
+      if (pos.inSeconds > 0 && pos.inSeconds % 5 == 0) {
+        _scheduleSaveState();
       }
     });
   }
 
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.paused || state == AppLifecycleState.detached) {
+      _saveStateNow();
+    }
+  }
+
   Future<void> _initApp() async {
+    final session = await AudioSession.instance;
+    await session.configure(const AudioSessionConfiguration.music());
+
     if (Platform.isAndroid) {
       await [
         Permission.notification,
@@ -96,10 +136,43 @@ class _PlayerScreenState extends State<PlayerScreen> {
     if (!await _musicDir.exists()) {
       await _musicDir.create(recursive: true);
     }
-    await _scanMusicFolder();
+    _stateFile = File('${docDir.path}/vibe_music_state.json');
+    await _scanMusicFolder(restoreState: true);
   }
 
-  Future<void> _scanMusicFolder() async {
+  // --- State Persistence ---
+  void _scheduleSaveState() {
+    _saveDebounce?.cancel();
+    _saveDebounce = Timer(const Duration(seconds: 2), _saveStateNow);
+  }
+
+  Future<void> _saveStateNow() async {
+    try {
+      final currentSong = (_queue.isNotEmpty && _currentIndex < _queue.length)
+          ? _queue[_currentIndex]
+          : null;
+      final data = {
+        'currentPath': currentSong?.audioPath,
+        'positionMs': _player.position.inMilliseconds,
+        'isShuffle': _isShuffle,
+        'repeatMode': _repeatMode.index,
+        'queuePaths': _queue.map((e) => e.audioPath).toList(),
+      };
+      await _stateFile.writeAsString(jsonEncode(data));
+    } catch (_) {}
+  }
+
+  Future?> _loadSavedState() async {
+    try {
+      if (await _stateFile.exists()) {
+        final content = await _stateFile.readAsString();
+        return jsonDecode(content) as Map<String, dynamic>;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  Future<void> _scanMusicFolder({bool restoreState = false}) async {
     final entities = _musicDir.listSync();
     final files = entities.whereType<File>().where((f) {
       final lower = f.path.toLowerCase();
@@ -119,17 +192,49 @@ class _PlayerScreenState extends State<PlayerScreen> {
       ));
     }
 
+    Map<String, dynamic>? saved;
+    if (restoreState) {
+      saved = await _loadSavedState();
+    }
+
     setState(() {
       _library
         ..clear()
         ..addAll(loaded);
-      _queue = List.from(_library);
-      if (_isShuffle) _queue.shuffle(Random());
-      _currentIndex = 0;
+
+      if (saved != null) {
+        _isShuffle = saved['isShuffle'] == true;
+        final repIdx = saved['repeatMode'] is int ? saved['repeatMode'] as int : 1;
+        _repeatMode = RepeatMode.values[repIdx.clamp(0, RepeatMode.values.length - 1)];
+
+        final savedQueuePaths = (saved['queuePaths'] as List?)?.cast<String>() ?? [];
+        final mapByPath = {for (var s in _library) s.audioPath: s};
+        final restoredQueue = <SongItem>[];
+        for (final p in savedQueuePaths) {
+          if (mapByPath.containsKey(p)) {
+            restoredQueue.add(mapByPath.remove(p)!);
+          }
+        }
+        restoredQueue.addAll(mapByPath.values);
+        _queue = restoredQueue;
+
+        final lastPath = saved['currentPath'] as String?;
+        final foundIdx = lastPath != null ? _queue.indexWhere((s) => s.audioPath == lastPath) : 0;
+        _currentIndex = foundIdx >= 0 ? foundIdx : 0;
+      } else {
+        _queue = List.from(_library);
+        if (_isShuffle) _queue.shuffle(Random());
+        _currentIndex = 0;
+      }
     });
 
     if (_queue.isNotEmpty) {
-      await _playAt(0, autoPlay: false);
+      final initialPosMs = (saved?['positionMs'] is int) ? saved!['positionMs'] as int : 0;
+      await _playAt(
+        _currentIndex,
+        autoPlay: false,
+        initialPosition: initialPosMs > 0 ? Duration(milliseconds: initialPosMs) : null,
+      );
     }
   }
 
@@ -137,6 +242,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
     final name = filePath.split(Platform.pathSeparator).last;
     final dot = name.lastIndexOf('.');
     return dot == -1 ? name : name.substring(0, dot);
+  }
+
+  String _getExtension(String filePath) {
+    final name = filePath.split(Platform.pathSeparator).last;
+    final dot = name.lastIndexOf('.');
+    return dot == -1 ? '' : name.substring(dot);
   }
 
   String? _findMatchingThumb(String baseName, List<FileSystemEntity> entities) {
@@ -153,7 +264,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
     return null;
   }
 
-  Future<void> _playAt(int index, {bool autoPlay = true}) async {
+  Future<void> _playAt(int index, {bool autoPlay = true, Duration? initialPosition}) async {
     if (index < 0 || index >= _queue.length) return;
     setState(() => _currentIndex = index);
 
@@ -169,16 +280,22 @@ class _PlayerScreenState extends State<PlayerScreen> {
       ),
     );
 
-    await _player.setAudioSource(source);
+    await _player.setAudioSource(source, initialPosition: initialPosition);
+    _saveStateNow();
     if (autoPlay) {
       await _player.play();
     }
   }
 
-  void _nextSong() {
+  void _nextSong({bool autoAdvance = false}) {
     if (_queue.isEmpty) return;
     int next = _currentIndex + 1;
     if (next >= _queue.length) {
+      if (autoAdvance && _repeatMode == RepeatMode.off) {
+        _player.pause();
+        _player.seek(Duration.zero);
+        return;
+      }
       if (_isShuffle) _queue.shuffle(Random());
       next = 0;
     }
@@ -187,6 +304,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   void _prevSong() {
     if (_queue.isEmpty) return;
+    if (_player.position.inSeconds > 3) {
+      _player.seek(Duration.zero);
+      return;
+    }
     int prev = _currentIndex - 1;
     if (prev < 0) prev = _queue.length - 1;
     _playAt(prev);
@@ -204,6 +325,303 @@ class _PlayerScreenState extends State<PlayerScreen> {
       _queue = [current, ...rest];
       _currentIndex = 0;
     });
+    _saveStateNow();
+  }
+
+  void _cycleRepeatMode() {
+    setState(() {
+      _repeatMode = RepeatMode.values[(_repeatMode.index + 1) % RepeatMode.values.length];
+    });
+    _saveStateNow();
+    final label = switch (_repeatMode) {
+      RepeatMode.off => 'Lặp lại: Tắt',
+      RepeatMode.all => 'Lặp lại: Tất cả danh sách',
+      RepeatMode.one => 'Lặp lại: 1 bài hiện tại',
+    };
+    ScaffoldMessenger.of(context).clearSnackBars();
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(label), duration: const Duration(seconds: 1)),
+    );
+  }
+
+  // --- Rename & Delete Song ---
+  Future<void> _renameSong(SongItem song) async {
+    final ctrl = TextEditingController(text: song.title);
+    final newNameRaw = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1E1E1E),
+        title: const Text('Đổi tên bài hát'),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          decoration: const InputDecoration(
+            hintText: 'Nhập tên mới...',
+            border: OutlineInputBorder(),
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Hủy')),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, ctrl.text.trim()),
+            child: const Text('Lưu'),
+          ),
+        ],
+      ),
+    );
+
+    if (newNameRaw == null || newNameRaw.isEmpty) return;
+    final safeNewName = newNameRaw.replaceAll(RegExp(r'[\\/:*?"<>|]'), '_').trim();
+    if (safeNewName.isEmpty || safeNewName == song.title) return;
+
+    final audioExt = _getExtension(song.audioPath);
+    final newAudioPath = '${_musicDir.path}/$safeNewName$audioExt';
+    if (await File(newAudioPath).exists()) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Tên bài hát này đã tồn tại!')),
+        );
+      }
+      return;
+    }
+
+    try {
+      final isPlayingThis = _queue.isNotEmpty && _queue[_currentIndex].id == song.id;
+      final wasPlaying = _player.playing;
+      final savedPos = _player.position;
+
+      if (isPlayingThis) {
+        await _player.stop();
+      }
+
+      await File(song.audioPath).rename(newAudioPath);
+      String? newThumbPath;
+      if (song.thumbPath != null && await File(song.thumbPath!).exists()) {
+        final thumbExt = _getExtension(song.thumbPath!);
+        newThumbPath = '${_musicDir.path}/$safeNewName$thumbExt';
+        await File(song.thumbPath!).rename(newThumbPath);
+      }
+
+      final updatedSong = SongItem(
+        id: newAudioPath,
+        title: safeNewName,
+        audioPath: newAudioPath,
+        thumbPath: newThumbPath,
+      );
+
+      setState(() {
+        final libIdx = _library.indexWhere((s) => s.id == song.id);
+        if (libIdx != -1) _library[libIdx] = updatedSong;
+        final qIdx = _queue.indexWhere((s) => s.id == song.id);
+        if (qIdx != -1) _queue[qIdx] = updatedSong;
+      });
+
+      if (isPlayingThis) {
+        await _playAt(_currentIndex, autoPlay: wasPlaying, initialPosition: savedPos);
+      } else {
+        _saveStateNow();
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Không thể đổi tên: $e')),
+        );
+      }
+    }
+  }
+
+  Future<void> _deleteSong(SongItem song) async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF1E1E1E),
+        title: const Text('Xóa bài hát?'),
+        content: Text('Xóa vĩnh viễn "${song.title}" khỏi bộ nhớ ứng dụng?'),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Hủy')),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: Colors.redAccent),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Xóa'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm != true) return;
+
+    try {
+      final isPlayingThis = _queue.isNotEmpty && _queue[_currentIndex].id == song.id;
+      if (isPlayingThis) {
+        await _player.stop();
+      }
+
+      if (await File(song.audioPath).exists()) {
+        await File(song.audioPath).delete();
+      }
+      if (song.thumbPath != null && await File(song.thumbPath!).exists()) {
+        await File(song.thumbPath!).delete();
+      }
+
+      setState(() {
+        _library.removeWhere((s) => s.id == song.id);
+        final removedQIdx = _queue.indexWhere((s) => s.id == song.id);
+        if (removedQIdx != -1) {
+          _queue.removeAt(removedQIdx);
+          if (_currentIndex > removedQIdx) {
+            _currentIndex--;
+          } else if (_currentIndex >= _queue.length) {
+            _currentIndex = _queue.isEmpty ? 0 : _queue.length - 1;
+          }
+        }
+      });
+
+      if (isPlayingThis && _queue.isNotEmpty) {
+        await _playAt(_currentIndex, autoPlay: false);
+      }
+      _saveStateNow();
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Lỗi khi xóa file: $e')),
+        );
+      }
+    }
+  }
+
+  // --- Sleep Timer Logic ---
+  void _setSleepTimer(int minutes) {
+    _cancelSleepTimer(notify: false);
+    final duration = Duration(minutes: minutes);
+    setState(() {
+      _sleepEndTime = DateTime.now().add(duration);
+      _remainingSleep = duration;
+    });
+
+    _sleepTimer = Timer(duration, () {
+      _player.pause();
+      _cancelSleepTimer(notify: false);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Đã hết giờ hẹn, nhạc đã tạm dừng.')),
+        );
+      }
+    });
+
+    _countdownTicker = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (_sleepEndTime == null) return;
+      final diff = _sleepEndTime!.difference(DateTime.now());
+      if (diff.isNegative) {
+        _cancelSleepTimer(notify: false);
+      } else if (mounted) {
+        setState(() => _remainingSleep = diff);
+      }
+    });
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('Sẽ tự động tắt nhạc sau $minutes phút')),
+    );
+  }
+
+  void _cancelSleepTimer({bool notify = true}) {
+    _sleepTimer?.cancel();
+    _countdownTicker?.cancel();
+    _sleepTimer = null;
+    _countdownTicker = null;
+    if (mounted) {
+      setState(() {
+        _sleepEndTime = null;
+        _remainingSleep = Duration.zero;
+      });
+      if (notify) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Đã hủy hẹn giờ tắt nhạc')),
+        );
+      }
+    }
+  }
+
+  Future<void> _showSleepTimerSheet() async {
+    final customCtrl = TextEditingController();
+    await showModalBottomSheet(
+      context: context,
+      backgroundColor: const Color(0xFF1A1A1A),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(18)),
+      ),
+      builder: (ctx) => Padding(
+        padding: EdgeInsets.only(
+          left: 20,
+          right: 20,
+          top: 20,
+          bottom: MediaQuery.of(ctx).viewInsets.bottom + 20,
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Text(
+                  'Hẹn giờ tắt nhạc',
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                ),
+                if (_sleepEndTime != null)
+                  TextButton(
+                    onPressed: () {
+                      Navigator.pop(ctx);
+                      _cancelSleepTimer();
+                    },
+                    child: const Text('Hủy hẹn giờ', style: TextStyle(color: Colors.redAccent)),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Wrap(
+              spacing: 10,
+              runSpacing: 10,
+              children: [15, 30, 45, 60, 90].map((mins) {
+                return ActionChip(
+                  label: Text('$mins phút'),
+                  onPressed: () {
+                    Navigator.pop(ctx);
+                    _setSleepTimer(mins);
+                  },
+                );
+              }).toList(),
+            ),
+            const SizedBox(height: 14),
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: customCtrl,
+                    keyboardType: TextInputType.number,
+                    decoration: const InputDecoration(
+                      hintText: 'Nhập số phút tùy chỉnh...',
+                      isDense: true,
+                      border: OutlineInputBorder(),
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                FilledButton(
+                  onPressed: () {
+                    final val = int.tryParse(customCtrl.text.trim());
+                    if (val != null && val > 0) {
+                      Navigator.pop(ctx);
+                      _setSleepTimer(val);
+                    }
+                  },
+                  child: const Text('Đặt giờ'),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   Future<void> _importLocalFiles() async {
@@ -221,6 +639,7 @@ class _PlayerScreenState extends State<PlayerScreen> {
       }
     }
     await _scanMusicFolder();
+    _saveStateNow();
   }
 
   Future<void> _showYoutubeDialog() async {
@@ -296,6 +715,8 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
       if (_queue.length == 1) {
         await _playAt(0);
+      } else {
+        _saveStateNow();
       }
 
       if (mounted) {
@@ -324,13 +745,20 @@ class _PlayerScreenState extends State<PlayerScreen> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _saveDebounce?.cancel();
+    _sleepTimer?.cancel();
+    _countdownTicker?.cancel();
+    _searchCtrl.dispose();
     _player.dispose();
     super.dispose();
   }
 
   @override
   Widget build(BuildContext context) {
-    final currentSong = _queue.isNotEmpty ? _queue[_currentIndex] : null;
+    final currentSong = (_queue.isNotEmpty && _currentIndex < _queue.length)
+        ? _queue[_currentIndex]
+        : null;
 
     return Scaffold(
       body: SafeArea(
@@ -350,11 +778,11 @@ class _PlayerScreenState extends State<PlayerScreen> {
               );
             } else {
               return Padding(
-                padding: const EdgeInsets.all(16),
+                padding: const EdgeInsets.all(14),
                 child: Column(
                   children: [
                     _buildPlayerPane(currentSong, compact: true),
-                    const SizedBox(height: 12),
+                    const SizedBox(height: 10),
                     Expanded(child: _buildQueuePane()),
                   ],
                 ),
@@ -367,7 +795,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   Widget _buildPlayerPane(SongItem? song, {required bool compact}) {
-    final coverSize = compact ? 140.0 : 220.0;
+    final coverSize = compact ? 115.0 : 210.0;
+
+    final repeatIcon = _repeatMode == RepeatMode.one ? Icons.repeat_one : Icons.repeat;
+    final repeatColor = _repeatMode == RepeatMode.off ? Colors.white54 : const Color(0xFFA78BFA);
 
     return Column(
       mainAxisAlignment: MainAxisAlignment.center,
@@ -385,18 +816,35 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   width: coverSize,
                   height: coverSize,
                   color: const Color(0xFF1F1F1F),
-                  child: const Icon(Icons.music_note, size: 60, color: Colors.white38),
+                  child: const Icon(Icons.music_note, size: 52, color: Colors.white38),
                 ),
         ),
-        const SizedBox(height: 12),
+        const SizedBox(height: 8),
         Text(
           song?.title ?? 'Chưa có bài nhạc nào',
           textAlign: TextAlign.center,
           maxLines: 2,
           overflow: TextOverflow.ellipsis,
-          style: const TextStyle(fontSize: 17, fontWeight: FontWeight.bold),
+          style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
         ),
-        const SizedBox(height: 4),
+        if (_sleepEndTime != null)
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: InkWell(
+              onTap: _showSleepTimerSheet,
+              child: Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 3),
+                decoration: BoxDecoration(
+                  color: const Color(0xFFA78BFA).withOpacity(0.18),
+                  borderRadius: BorderRadius.circular(20),
+                ),
+                child: Text(
+                  'Tắt nhạc sau ${_formatDuration(_remainingSleep)}',
+                  style: const TextStyle(fontSize: 12, color: Color(0xFFA78BFA)),
+                ),
+              ),
+            ),
+          ),
         StreamBuilder<Duration>(
           stream: _player.positionStream,
           builder: (context, snapshot) {
@@ -415,7 +863,10 @@ class _PlayerScreenState extends State<PlayerScreen> {
                   child: Slider(
                     value: valMs,
                     max: maxMs,
-                    onChanged: (v) => _player.seek(Duration(milliseconds: v.toInt())),
+                    onChanged: (v) {
+                      _player.seek(Duration(milliseconds: v.toInt()));
+                      _scheduleSaveState();
+                    },
                   ),
                 ),
                 Padding(
@@ -436,11 +887,12 @@ class _PlayerScreenState extends State<PlayerScreen> {
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
             IconButton(
-              icon: Icon(Icons.shuffle, color: _isShuffle ? const Color(0xFFA78BFA) : Colors.white54),
+              icon: Icon(Icons.shuffle, size: 22, color: _isShuffle ? const Color(0xFFA78BFA) : Colors.white54),
+              tooltip: 'Phát ngẫu nhiên',
               onPressed: _toggleShuffle,
             ),
             IconButton(
-              icon: const Icon(Icons.skip_previous, size: 32),
+              icon: const Icon(Icons.skip_previous, size: 30),
               onPressed: _prevSong,
             ),
             StreamBuilder<PlayerState>(
@@ -450,19 +902,38 @@ class _PlayerScreenState extends State<PlayerScreen> {
                 return IconButton(
                   icon: Icon(
                     playing ? Icons.pause_circle_filled : Icons.play_circle_filled,
-                    size: 54,
+                    size: 52,
                     color: Colors.white,
                   ),
                   onPressed: () {
                     if (_queue.isEmpty) return;
-                    playing ? _player.pause() : _player.play();
+                    if (playing) {
+                      _player.pause();
+                      _saveStateNow();
+                    } else {
+                      _player.play();
+                    }
                   },
                 );
               },
             ),
             IconButton(
-              icon: const Icon(Icons.skip_next, size: 32),
-              onPressed: _nextSong,
+              icon: const Icon(Icons.skip_next, size: 30),
+              onPressed: () => _nextSong(autoAdvance: false),
+            ),
+            IconButton(
+              icon: Icon(repeatIcon, size: 22, color: repeatColor),
+              tooltip: 'Chế độ lặp lại',
+              onPressed: _cycleRepeatMode,
+            ),
+            IconButton(
+              icon: Icon(
+                Icons.bedtime_outlined,
+                size: 22,
+                color: _sleepEndTime != null ? const Color(0xFFA78BFA) : Colors.white54,
+              ),
+              tooltip: 'Hẹn giờ tắt nhạc',
+              onPressed: _showSleepTimerSheet,
             ),
           ],
         ),
@@ -494,6 +965,13 @@ class _PlayerScreenState extends State<PlayerScreen> {
   }
 
   Widget _buildQueuePane() {
+    final isSearching = _searchQuery.trim().isNotEmpty;
+    final filteredSongs = isSearching
+        ? _library
+            .where((s) => s.title.toLowerCase().contains(_searchQuery.trim().toLowerCase()))
+            .toList()
+        : <SongItem>[];
+
     final upcomingCount = _queue.length > _currentIndex + 1 ? _queue.length - (_currentIndex + 1) : 0;
 
     return Container(
@@ -501,108 +979,202 @@ class _PlayerScreenState extends State<PlayerScreen> {
         color: const Color(0xFF141414),
         borderRadius: BorderRadius.circular(14),
       ),
-      padding: const EdgeInsets.all(14),
+      padding: const EdgeInsets.all(12),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceBetween,
             children: [
-              const Text('Danh sách chờ', style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
-              Text('$upcomingCount bài tiếp theo', style: const TextStyle(fontSize: 12, color: Colors.white54)),
+              Text(
+                isSearching ? 'Kết quả tìm kiếm (${filteredSongs.length})' : 'Danh sách chờ',
+                style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
+              ),
+              if (!isSearching)
+                Text('$upcomingCount bài tiếp theo', style: const TextStyle(fontSize: 12, color: Colors.white54)),
             ],
           ),
-          const SizedBox(height: 10),
+          const SizedBox(height: 8),
+          TextField(
+            controller: _searchCtrl,
+            onChanged: (val) => setState(() => _searchQuery = val),
+            style: const TextStyle(fontSize: 13),
+            decoration: InputDecoration(
+              hintText: 'Tìm kiếm bài hát trong kho...',
+              prefixIcon: const Icon(Icons.search, size: 18),
+              suffixIcon: isSearching
+                  ? IconButton(
+                      icon: const Icon(Icons.clear, size: 18),
+                      onPressed: () {
+                        _searchCtrl.clear();
+                        setState(() => _searchQuery = '');
+                      },
+                    )
+                  : null,
+              isDense: true,
+              contentPadding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
+              filled: true,
+              fillColor: const Color(0xFF1E1E1E),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(10),
+                borderSide: BorderSide.none,
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
           Expanded(
-            child: upcomingCount == 0
-                ? const Center(
-                    child: Text(
-                      'Danh sách chờ trống.\nHãy tải từ YouTube hoặc thêm nhạc từ máy!',
-                      textAlign: TextAlign.center,
-                      style: TextStyle(color: Colors.white54),
-                    ),
-                  )
-                : ReorderableListView.builder(
-                    buildDefaultDragHandles: false,
-                    itemCount: upcomingCount,
-                    onReorder: (oldIndex, newIndex) {
-                      setState(() {
-                        if (oldIndex < newIndex) newIndex -= 1;
-                        final actualOld = _currentIndex + 1 + oldIndex;
-                        final actualNew = _currentIndex + 1 + newIndex;
-                        final item = _queue.removeAt(actualOld);
-                        _queue.insert(actualNew, item);
-                      });
-                    },
-                    itemBuilder: (context, idx) {
-                      final queuePos = _currentIndex + 1 + idx;
-                      final item = _queue[queuePos];
-
-                      return Container(
-                        key: ValueKey('${item.id}_$queuePos'),
-                        decoration: const BoxDecoration(
-                          border: Border(bottom: BorderSide(color: Color(0xFF222222))),
-                        ),
-                        child: ListTile(
-                          contentPadding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
-                          onTap: () => _playAt(queuePos),
-                          leading: Row(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
-                              ReorderableDragStartListener(
-                                index: idx,
-                                child: const Padding(
-                                  padding: EdgeInsets.only(right: 10),
-                                  child: Icon(Icons.drag_handle, color: Colors.white38),
-                                ),
-                              ),
-                              ClipRRect(
-                                borderRadius: BorderRadius.circular(6),
-                                child: item.thumbPath != null
-                                    ? Image.file(
-                                        File(item.thumbPath!),
-                                        width: 44,
-                                        height: 44,
-                                        fit: BoxFit.cover,
-                                      )
-                                    : Container(
-                                        width: 44,
-                                        height: 44,
-                                        color: const Color(0xFF262626),
-                                        child: const Icon(Icons.music_note, size: 20, color: Colors.white54),
-                                      ),
-                              ),
-                            ],
-                          ),
-                          title: Text(
-                            item.title,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
-                          ),
-                          trailing: PopupMenuButton<String>(
-                            icon: const Icon(Icons.more_vert, color: Colors.white54),
-                            onSelected: (value) {
-                              setState(() {
-                                if (value == 'next' && queuePos > _currentIndex + 1) {
-                                  final moved = _queue.removeAt(queuePos);
-                                  _queue.insert(_currentIndex + 1, moved);
-                                } else if (value == 'remove') {
-                                  _queue.removeAt(queuePos);
-                                }
-                              });
+            child: isSearching
+                ? (filteredSongs.isEmpty
+                    ? const Center(
+                        child: Text('Không tìm thấy bài hát phù hợp.', style: TextStyle(color: Colors.white54)),
+                      )
+                    : ListView.builder(
+                        itemCount: filteredSongs.length,
+                        itemBuilder: (context, idx) {
+                          final item = filteredSongs[idx];
+                          return _buildSongTile(
+                            item: item,
+                            onTap: () {
+                              final qIdx = _queue.indexWhere((s) => s.id == item.id);
+                              if (qIdx != -1) {
+                                _playAt(qIdx);
+                              } else {
+                                setState(() => _queue.insert(_currentIndex + 1, item));
+                                _playAt(_currentIndex + 1);
+                              }
                             },
-                            itemBuilder: (_) => const [
-                              PopupMenuItem(value: 'next', child: Text('Phát kế tiếp')),
-                              PopupMenuItem(value: 'remove', child: Text('Xóa khỏi hàng chờ')),
+                            menuItems: const [
+                              PopupMenuItem(value: 'rename', child: Text('Đổi tên bài hát')),
+                              PopupMenuItem(
+                                value: 'delete',
+                                child: Text('Xóa khỏi máy', style: TextStyle(color: Colors.redAccent)),
+                              ),
                             ],
-                          ),
+                            onMenuSelected: (val) {
+                              if (val == 'rename') _renameSong(item);
+                              if (val == 'delete') _deleteSong(item);
+                            },
+                          );
+                        },
+                      ))
+                : (upcomingCount == 0
+                    ? const Center(
+                        child: Text(
+                          'Danh sách chờ trống.\nHãy tải từ YouTube hoặc thêm nhạc từ máy!',
+                          textAlign: TextAlign.center,
+                          style: TextStyle(color: Colors.white54),
                         ),
-                      );
-                    },
+                      )
+                    : ReorderableListView.builder(
+                        buildDefaultDragHandles: false,
+                        itemCount: upcomingCount,
+                        onReorder: (oldIndex, newIndex) {
+                          setState(() {
+                            if (oldIndex < newIndex) newIndex -= 1;
+                            final actualOld = _currentIndex + 1 + oldIndex;
+                            final actualNew = _currentIndex + 1 + newIndex;
+                            final item = _queue.removeAt(actualOld);
+                            _queue.insert(actualNew, item);
+                          });
+                          _saveStateNow();
+                        },
+                        itemBuilder: (context, idx) {
+                          final queuePos = _currentIndex + 1 + idx;
+                          final item = _queue[queuePos];
+
+                          return Container(
+                            key: ValueKey('${item.id}_$queuePos'),
+                            decoration: const BoxDecoration(
+                              border: Border(bottom: BorderSide(color: Color(0xFF222222))),
+                            ),
+                            child: _buildSongTile(
+                              item: item,
+                              dragIndex: idx,
+                              onTap: () => _playAt(queuePos),
+                              menuItems: const [
+                                PopupMenuItem(value: 'next', child: Text('Phát kế tiếp')),
+                                PopupMenuItem(value: 'rename', child: Text('Đổi tên bài hát')),
+                                PopupMenuItem(value: 'remove', child: Text('Xóa khỏi hàng chờ')),
+                                PopupMenuItem(
+                                  value: 'delete',
+                                  child: Text('Xóa vĩnh viễn khỏi máy', style: TextStyle(color: Colors.redAccent)),
+                                ),
+                              ],
+                              onMenuSelected: (value) {
+                                if (value == 'next' && queuePos > _currentIndex + 1) {
+                                  setState(() {
+                                    final moved = _queue.removeAt(queuePos);
+                                    _queue.insert(_currentIndex + 1, moved);
+                                  });
+                                  _saveStateNow();
+                                } else if (value == 'remove') {
+                                  setState(() => _queue.removeAt(queuePos));
+                                  _saveStateNow();
+                                } else if (value == 'rename') {
+                                  _renameSong(item);
+                                } else if (value == 'delete') {
+                                  _deleteSong(item);
+                                }
+                              },
+                            ),
+                          );
+                        },
+                      )),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildSongTile({
+    required SongItem item,
+    required VoidCallback onTap,
+    required List<PopupMenuEntry<String>> menuItems,
+    required void Function(String) onMenuSelected,
+    int? dragIndex,
+  }) {
+    return ListTile(
+      contentPadding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+      onTap: onTap,
+      leading: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (dragIndex != null)
+            ReorderableDragStartListener(
+              index: dragIndex,
+              child: const Padding(
+                padding: EdgeInsets.only(right: 8),
+                child: Icon(Icons.drag_handle, color: Colors.white38),
+              ),
+            ),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(6),
+            child: item.thumbPath != null
+                ? Image.file(
+                    File(item.thumbPath!),
+                    width: 42,
+                    height: 42,
+                    fit: BoxFit.cover,
+                  )
+                : Container(
+                    width: 42,
+                    height: 42,
+                    color: const Color(0xFF262626),
+                    child: const Icon(Icons.music_note, size: 20, color: Colors.white54),
                   ),
           ),
         ],
+      ),
+      title: Text(
+        item.title,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
+      ),
+      trailing: PopupMenuButton<String>(
+        icon: const Icon(Icons.more_vert, color: Colors.white54),
+        onSelected: onMenuSelected,
+        itemBuilder: (_) => menuItems,
       ),
     );
   }
