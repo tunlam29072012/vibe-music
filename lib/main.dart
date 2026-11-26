@@ -162,11 +162,11 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
     } catch (_) {}
   }
 
-  Future?> _loadSavedState() async {
+  dynamic _loadSavedState() async {
     try {
       if (await _stateFile.exists()) {
         final content = await _stateFile.readAsString();
-        return jsonDecode(content) as Map<String, dynamic>;
+        return jsonDecode(content);
       }
     } catch (_) {}
     return null;
@@ -192,7 +192,7 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
       ));
     }
 
-    Map<String, dynamic>? saved;
+    dynamic saved;
     if (restoreState) {
       saved = await _loadSavedState();
     }
@@ -202,7 +202,7 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
         ..clear()
         ..addAll(loaded);
 
-      if (saved != null) {
+      if (saved != null && saved is Map) {
         _isShuffle = saved['isShuffle'] == true;
         final repIdx = saved['repeatMode'] is int ? saved['repeatMode'] as int : 1;
         _repeatMode = RepeatMode.values[repIdx.clamp(0, RepeatMode.values.length - 1)];
@@ -229,7 +229,7 @@ class _PlayerScreenState extends State<PlayerScreen> with WidgetsBindingObserver
     });
 
     if (_queue.isNotEmpty) {
-      final initialPosMs = (saved?['positionMs'] is int) ? saved!['positionMs'] as int : 0;
+      final initialPosMs = (saved is Map && saved['positionMs'] is int) ? saved['positionMs'] as int : 0;
       await _playAt(
         _currentIndex,
         autoPlay: false,
