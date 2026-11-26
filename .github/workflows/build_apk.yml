@@ -18,8 +18,17 @@ jobs:
         with:
           flutter-version: '3.24.0'
           channel: 'stable'
+
+      # Xóa cấu trúc android cũ bị lỗi Gradle và tạo lại chuẩn mới
+      - name: Regenerate Android Project
+        run: |
+          rm -rf android
+          flutter create --platforms=android --org com.tunlam --project-name vibe_music .
+          sed -i 's/<application/<uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"\/>\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"\/>\n    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO"\/>\n    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES"\/>\n    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"\/>\n    <application android:requestLegacyExternalStorage="true"/g' android/app/src/main/AndroidManifest.xml
+
       - run: flutter pub get
       - run: flutter build apk --release
+
       - uses: actions/upload-artifact@v4
         with:
           name: vibe-music-apk
